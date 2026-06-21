@@ -11,6 +11,7 @@ import pandas as pd
 import datetime as dt
 from src.config.config import get_connection_string, get_config_dict
 from src.config import config_model
+from polars.exceptions import ColumnNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -104,10 +105,11 @@ class ETL:
     @staticmethod
     def prepare_dataframe(
             df: pd.DataFrame,
+            x: str,
             y: str,
             date_cut: str,
-            exclude_materials: list,
-            single_material: str | None
+            exclude_materials: list | None = None,
+            single_material: str | None = None
     ) -> pd.DataFrame:
         # Transformation layer. Manipulates the Pandas (following Prophet compatibility) dataframes
         # loaded from the queries to better fit the Prophet conventions
@@ -132,22 +134,27 @@ class ETL:
         if y not in VALID_TARGETS:
             raise ValueError(f'Invalid target "{y}" not in {VALID_TARGETS}')
 
+
+        needed_columns: list[str] = [x, "Y", "M"]
+        if not pd.Index(needed_columns).isin(df.columns).all():
+            missing_columns: list[str] = list(set(needed_columns) - set(df.columns))
+            raise ColumnNotFoundError(f'Column(s) "{missing_columns}" missing')
+
         if single_material is not None:
-            df = df[df['Material'] == single_material]
+            df = df[df[x] == single_material]
 
         if single_material is None and exclude_materials is not None:
-            df = df[~df['Material'].isin(exclude_materials)]
+            df = df[~df[x].isin(exclude_materials)]
 
         if date_cut is not None:
             try:
-                date_cut: str = dt.date.today().strftime('%Y/%m')
                 df = df[df['YearMonth'] < date_cut]
             except Exception as e:
                 raise Exception(f'Error applying date limiting in dataframe: {e}')
 
         try:
             df = df.groupby([
-                'Material',
+                x,
                 'Y',
                 'M'
             ]).agg({
@@ -166,10 +173,10 @@ class ETL:
         if y == 'ASP':
             final_df = df
             final_df = final_df.rename(columns={y: 'y'}).sort_values('ds', ascending=True)
-            final_df = final_df[['Material', 'ds', 'y']]
+            final_df = final_df[[x, 'ds', 'y']]
 
         if y == 'QT':
             final_df: pd.DataFrame = df.rename(columns={y: 'y'}).sort_values('ds', ascending=True)
-            final_df = final_df[['Material', 'ds', 'y']]
+            final_df = final_df[[x, 'ds', 'y']]
 
         return final_df
