@@ -107,7 +107,7 @@ class ETL:
             df: pd.DataFrame,
             x: str,
             y: str,
-            date_cut: str,
+            date_cut: str | None = None,
             exclude_materials: list | None = None,
             single_material: str | None = None
     ) -> pd.DataFrame:
