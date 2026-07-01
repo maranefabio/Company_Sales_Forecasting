@@ -109,7 +109,7 @@ class ForecastModel:
             self,
             df: pd.DataFrame,
             n_trials: int,
-            base_path: str | None,
+            base_path: str | None = None,
             store: bool = False
     ) -> dict:
         # Run an Optuna hyperparameter search using rolling-origin cross-validation.
@@ -217,6 +217,9 @@ class ForecastModel:
         )
 
         if store:
+            if base_path is None:
+                raise ValueError(f'Base path cannot be None for store=True')
+
             if not os.path.exists(parameters_path):
                 os.makedirs(parameters_path)
 
