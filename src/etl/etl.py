@@ -1,182 +1,353 @@
-# NOTE: This module is responsible for the ETL process, from the extraction of a SQL Server data to the manipulation
-# needed to fit Prophet's tools. As this portfolio project uses mock data, the only part used will
-# be the transformation. In production, this module serves as a complete ETL pipeline from the production database
-# to the Forecast Model.
+# Local ETL pipeline extracting SKU-level ASP/QT fact data from SQL Server into CSV files, then
+# cleaning and featurizing it into Prophet-ready dataframes.
 
-import os
-import pyodbc
+# The module "ETL" adds:
+# - A thin "extract" step running a SQL query file against the source database and persisting the
+#   raw result as a semicolon-separated CSV.
+# - An "ingest" step for (re)loading any previously persisted CSV layer back into a polars DataFrame.
+# - A "clean" step aggregating raw fact-table rows to monthly granularity per SKU.
+# - A "featurize" step turning monthly-cleaned data into one Prophet-convention ("SKU", "ds", "y")
+#   dataframe per requested target (e.g. ASP, QT).
+
+# The typical workflow is:
+#   >>> ETL.extract(
+#   ...     base_path=base_path, database_settings=database_settings,
+#   ...     query_file='fact_sales.sql', store_raw_as='FactSalesAct.csv', output_path=output_path
+#   ... )
+#   >>> cleaned_df = ETL.clean(
+#   ...     raw_data_df=None, output_path=output_path, raw_file_name='FactSalesAct.csv',
+#   ...     store_as='FactSalesAct.csv', schema_overrides=None
+#   ... )
+#   >>> asp_df, qt_df = ETL.featurize(
+#   ...     cleaned_data_df=cleaned_df, output_path=output_path, targets=['ASP', 'QT'], store=True
+#   ... )
+
+#   Each static method reads/writes its own CSV layer under "output_path/data/{raw,cleaned,featurized}",
+#   so steps can also be run independently (e.g. "featurize" re-ingests the cleaned layer from disk
+#   when "cleaned_data_df" is not supplied directly).
+
 import logging
 import polars as pl
 import pandas as pd
-import datetime as dt
-from src.config.config import get_connection_string, get_config_dict
-from src.config import config_model
+from pathlib import Path
+from src.etl import Database
+from src.settings.database import DatabaseSettings
 from polars.exceptions import ColumnNotFoundError
 
+# Instantiating logger for the file
 logger = logging.getLogger(__name__)
 
 
-VALID_TARGETS: tuple[str, ...] = config_model.VALID_TARGETS
-
-
 class EmptyTableException(RuntimeError):
-    # Raised when any query executed in ETL.update_local returns an empty table
+    # Raised when a query, an ingested CSV file, or a per-target featurization step in "ETL"
+    # returns/produces a table with zero rows.
     pass
 
 
 class ETL:
-    @staticmethod
-    def _connect(connection_string: str) -> pyodbc.Connection:
-        # Tries to connect to the database, using the connection string generated from the .env file data
-
-        # Args:
-        #   - connection_string: SQL Server connection string, generated from the .env file data
-
-        # Returns:
-        #   - pyobc.Connection, used to execute SQL commands
-
-        # Raises:
-        #   - Exception: Re-raises any error encountered while trying a connection with the given connection string
-
-        config_dict: dict = get_config_dict()
-        try:
-            logger.info(f'Trying to connect to database {config_dict.get('SERVER')}: {config_dict.get("DATABASE")} ...')
-            connection: pyodbc.Connection = pyodbc.connect(connection_string)
-            logger.info('Sucessfully connected to database')
-            return connection
-
-        except Exception as e:
-            raise Exception(f'Unable to connect to database: {e}')
+    # Collection of static ETL steps (extract -> ingest -> clean -> featurize) that move data from
+    # the source database into local CSV layers and, ultimately, into Prophet-ready dataframes.
 
     @staticmethod
-    def _dataframe(query: str, query_name: str) -> pl.DataFrame:
-        # Generate a Polars dataframe from a SQL query
+    def extract(
+        base_path: Path,
+        database_settings: DatabaseSettings,
+        query_file: str,
+        store_raw_as: str,
+        output_path: Path,
+    ) -> None:
+        # Run a single SQL query file against the source database and persist the result as a raw CSV.
 
         # Args:
-        #   - query: SQL query loaded from a .sql file stored in "base_path/queries"
-        #   - query_name: Name of the file (String before .sql)
-
-        # Returns:
-        #   - Polars dataframe generated from the SQL query
-
-        # Raises:
-        #   - Exception: Re-raises any error encountered while executing the query
-
-        connection: pyodbc.Connection = ETL._connect(get_connection_string())
-        try:
-            df: pl.DataFrame = pl.read_database(connection=connection, query=query)
-            return df
-        except Exception as e:
-            raise Exception(f'Error reading {query_name} from {get_config_dict().get("SERVER")}: {e}')
-
-    @staticmethod
-    def update_local(base_path: str) -> None:
-        # Update the local CSV files containing the ASP and QT time series fact tables
-
-        # Args:
-        #   - base_path: Root directory where local files are stored
+        #   - base_path: Root directory used to locate the query file, expected at
+        #     "base_path/src/files/queries/{query_file}".
+        #   - database_settings: Settings used to open the database connection.
+        #   - query_file: Filename of the SQL query file (under "base_path/src/files/queries/") to
+        #     execute against the database.
+        #   - store_raw_as: Filename under which the raw query result is saved as CSV.
+        #   - output_path: Root directory under which "data/raw/{store_raw_as}" is written.
 
         # Raises:
-        #   - EmptyTableException: Raised when any of the queries returns an empty table
-        #   - Exception: Re-raises any error encountered while updating local files
+        #   - EmptyTableException: Raised when the query returns an empty table (zero rows).
+        #   - Exception: Re-raises any error encountered while connecting, reading the query file,
+        #     querying, or writing the CSV.
 
-        config_dict: dict = get_config_dict()
-        query_dir: str = os.path.join(base_path, 'queries')
-        logger.info('Extracting data from database ...')
-        try:
-            for query_file in os.listdir(query_dir):
-                with open(os.path.join(query_dir, query_file), 'r') as file:
-                    logger.info(
-                        f'Processing query file: {query_file} from'
-                        f' {config_dict.get("SERVER")}:{config_dict.get("DATABASE")}'
-                    )
+        logger.debug(f'Extracting data from {database_settings.server}:{database_settings.database}')
+
+        db: Database = Database(database_settings)
+
+        with db.connect() as connection:
+            try:
+                with open(base_path / 'src' / 'files' / 'queries' / query_file, 'r') as file:
+                    logger.debug(f'Processing query file {query_file}')
+
                     sql_query: str = file.read()
-                    query_name: str = f'{query_file}'.replace('.sql', '')
-                    df: pl.DataFrame = ETL._dataframe(sql_query, query_name)
+
+                    df: pl.DataFrame = pl.read_database(connection=connection, query=sql_query)
 
                     if len(df) == 0:
-                        raise EmptyTableException(f'Query file {query_file} is empty')
+                        raise EmptyTableException(f'Query {query_file} returned empty table')
 
+                    df.write_csv(output_path / 'data' / 'raw' / store_raw_as,  separator=';')
 
-                    df.write_csv(os.path.join(base_path, 'csv', f'{query_name}.csv'), separator=';')
-        except Exception as e:
-            raise Exception(f'Error updating {query_name}: {e}')
+            except Exception as e:
+                logger.error(f'Error updating local files: {e}')
+                raise
 
     @staticmethod
-    def prepare_dataframe(
-            df: pd.DataFrame,
-            x: str,
-            y: str,
-            date_cut: str | None = None,
-            exclude_materials: list | None = None,
-            single_material: str | None = None
-    ) -> pd.DataFrame:
-        # Transformation layer. Manipulates the Pandas (following Prophet compatibility) dataframes
-        # loaded from the queries to better fit the Prophet conventions
+    def ingest(
+        output_path: Path,
+        query: str,
+        layer: str,
+        schema_overrides: dict | None,
+    ) -> pl.DataFrame:
+        # Load a previously persisted CSV layer from local storage into a polars DataFrame.
+
+        # Note:
+        #   Despite its name, "query" is a CSV filename (e.g. "FactSalesAct.csv"), not a SQL query
+        #   string — this method only reads from local disk, it does not hit the database.
 
         # Args:
-        #   - df: Raw fact table dataframe containing the time series of
-        #     QT or ASP, or both of them joined
-        #   - y: Target column (ASP or QT)
-        #   - date_cut: Date limit for model training. It will be fitted on a dateset where ds < date_cut
-        #   - exclude_materials: Materials/SKUs to exclude from the model. Useful when the dataframe contains
-        #     more materials than needed, or to apply the model to a limited set of them
-        #   - single_material: A material identifier, when the user wants to apply the model to a single one.
-        #     Overrides exclude_materials.
+        #   - output_path: Root directory containing the "data/{layer}/" folder to read from.
+        #   - query: Filename (including extension) of the semicolon-separated CSV file to read,
+        #     located under "output_path/data/{layer}/".
+        #   - layer: Pipeline layer/subfolder to read from (e.g. "raw", "cleaned"). Required.
+        #   - schema_overrides: Optional polars dtype override dict, forwarded to "pl.read_csv" to
+        #     force specific column types.
 
         # Returns:
-        #   Treated Pandas dataframe containing the Prophet convention columns (ds, y). The day will
-        #   be automatically set to 1 for each row date.
+        #   The loaded polars DataFrame.
 
         # Raises:
-        #   - Exception: Re-raises any error encountered while treating dataframe.
+        #   - Exception: Raised when "layer" is None, or re-raised from any error encountered while
+        #     reading the CSV file.
+        #   - EmptyTableException: Raised when the loaded CSV contains zero rows.
 
-        if y not in VALID_TARGETS:
-            raise ValueError(f'Invalid target "{y}" not in {VALID_TARGETS}')
+        if layer is None:
+            raise Exception('Ingestion layer not specified')
 
-
-        needed_columns: list[str] = [x, "Y", "M"]
-        if not pd.Index(needed_columns).isin(df.columns).all():
-            missing_columns: list[str] = list(set(needed_columns) - set(df.columns))
-            raise ColumnNotFoundError(f'Column(s) "{missing_columns}" missing')
-
-        if single_material is not None:
-            df = df[df[x] == single_material]
-
-        if single_material is None and exclude_materials is not None:
-            df = df[~df[x].isin(exclude_materials)]
-
-        if date_cut is not None:
-            try:
-                df = df[df['YearMonth'] < date_cut]
-            except Exception as e:
-                raise Exception(f'Error applying date limiting in dataframe: {e}')
+        logger.debug(f'Ingesting data from data/{layer}/{query}')
 
         try:
-            df = df.groupby([
-                x,
-                'Y',
-                'M'
-            ]).agg({
-                f'{y}': 'sum',
-            }).reset_index()
+            df: pl.DataFrame = pl.read_csv(
+                output_path / 'data' / layer / f'{query}',
+                schema_overrides=schema_overrides,
+                separator=';'
+            )
 
-            df['ds'] = pd.to_datetime({
-                'year': df['Y'],
-                'month': df['M'],
+            if len(df) == 0:
+                raise EmptyTableException(f'Ingestion returned empty table for data/{layer}/{query}')
+
+            return df
+
+        except Exception as e:
+            logger.error(f'Error ingesting {query}: {e}')
+            raise
+
+
+    @staticmethod
+    def clean(
+        raw_data_df: pl.DataFrame | None,
+        output_path: Path | None,
+        raw_file_name: str | None,
+        store_as: str | None,
+        schema_overrides: dict | None,
+    ) -> pd.DataFrame:
+        # Aggregate raw fact-table rows to monthly granularity per SKU (summing QT, averaging ASP).
+
+        # Args:
+        #   - raw_data_df: Raw fact table dataframe (as produced by "extract"/"ingest"), expected to
+        #     contain at least "Dt" (date), "SKU", "QT" and "ASP" columns. When None, it is loaded via
+        #     "ETL.ingest" from "data/raw/{raw_file_name}".
+        #   - output_path: Root directory used both to ingest the raw file (when "raw_data_df" is
+        #     None) and to store the cleaned output (when "store_as" is provided).
+        #   - raw_file_name: Filename of the raw CSV to ingest when "raw_data_df" is None. Also used
+        #     for logging regardless.
+        #   - store_as: Filename under which the cleaned data is saved as CSV under "data/cleaned/".
+        #     When None, the cleaned data is only returned, not persisted.
+        #   - schema_overrides: Optional polars dtype override dict, forwarded to "ETL.ingest" when
+        #     "raw_data_df" is None.
+
+        # Returns:
+        #   A pandas DataFrame with one row per ("SKU", "YearMonth"), containing "SKU", "YearMonth",
+        #   "Y" (year), "M" (month), the summed "QT" and the averaged "ASP".
+
+        # Raises:
+        #   - Exception: Re-raises any error encountered while deriving the date parts or aggregating
+        #     the data (e.g. if "raw_data_df" is missing an expected column).
+
+        logger.debug(f'Cleaning raw data from data/raw/{raw_file_name}')
+
+        if raw_data_df is None:
+            raw_data_df: pl.DataFrame = ETL.ingest(
+                output_path = output_path,
+                query = raw_file_name,
+                schema_overrides = schema_overrides,
+                layer = 'raw'
+            )
+
+        try:
+            cleaned_data_df = raw_data_df.with_columns(
+                pl.col('Dt').dt.year().alias('Y'),
+                pl.col('Dt').dt.month().alias('M'),
+                pl.col('Dt').dt.strftime("%Y/m").alias('YearMonth')
+            ).group_by([
+                'SKU',
+                'YearMonth',
+                'Y',
+                'M',
+            ]).agg([
+                pl.col('QT').sum().alias('QT'),
+                pl.col('ASP').mean().alias('ASP'),
+            ])
+
+        except Exception as e:
+            logger.error(f'Error cleaning raw data: {e}')
+            raise
+
+        if store_as is not None:
+            logger.debug(f'Storing cleaned data in data/cleaned/{store_as}')
+
+            cleaned_data_df.write_csv(
+                output_path / 'data' / 'cleaned' / f'{store_as}',
+                separator=';'
+            )
+
+        return cleaned_data_df.to_pandas()
+
+    @staticmethod
+    def featurize(
+        cleaned_data_df: pl.DataFrame | None,
+        output_path: Path,
+        targets: list[str],
+        store: bool = False,
+        date_limits: list | None = None
+    ) -> list[pd.DataFrame]:
+        # Transformation layer. Builds one Prophet-convention ("SKU", "ds", "y") dataframe per
+        # requested target out of monthly-cleaned data.
+
+        # Note:
+        #   "date_limits[0]"/"date_limits[1]" are accessed unconditionally, so despite its type hint
+        #   and default, "date_limits" must be passed as a two-element list (either element may
+        #   individually be None to leave that bound unrestricted) — passing "date_limits=None"
+        #   itself will raise a TypeError.
+
+        # Args:
+        #   - cleaned_data_df: Monthly-cleaned dataframe (as produced by "clean"), expected to contain
+        #     at least "SKU", "Y", "M", "YearMonth" and the columns named in "targets". When None, it
+        #     is loaded via "ETL.ingest" from "data/cleaned/FactSalesAct.csv" using a fixed schema.
+        #   - output_path: Root directory used both to ingest the cleaned file (when "cleaned_data_df"
+        #     is None) and to store featurized output (when "store" is True).
+        #   - targets: List of target column names (e.g. ["ASP", "QT"]) to featurize; one output
+        #     dataframe is produced per target, in the same order.
+        #   - store: Whether to persist each target's featurized dataframe as CSV under
+        #     "data/featurized/{target}.csv". Requires "output_path" to be set. Default = False.
+        #   - date_limits: Two-element list "[lower, upper]" of inclusive "YearMonth" bounds used to
+        #     filter "cleaned_data_df" before featurizing. Either element may be None to leave that
+        #     bound unrestricted.
+
+        # Returns:
+        #   A list of pandas DataFrames, one per entry in "targets" (same order), each with columns
+        #   "SKU", "ds" (first-of-month datetime derived from "Y"/"M") and "y" (renamed from the
+        #   target column), sorted by "ds" ascending.
+
+        # Raises:
+        #   - ColumnNotFoundError: If "cleaned_data_df" is missing any of "SKU", "Y", "M".
+        #   - EmptyTableException: If, after filtering and sorting, a given target's dataframe ends up
+        #     empty.
+        #   - Exception: If "targets" is None, or wrapping any other error encountered while
+        #     featurizing a given target (includes the target name and original error message).
+
+        logger.debug(f'Featurizing {targets} data')
+
+        if cleaned_data_df is None:
+            cleaned_data_df = ETL.ingest(
+                output_path = output_path,
+                query = 'FactSalesAct.csv',
+                schema_overrides = {
+                    'SKU': pl.String,
+                    'YearMonth': pl.String,
+                    'Y': pl.Int16,
+                    'M': pl.Int8,
+                    'QT': pl.Float64,
+                    'ASP': pl.Float64
+               },
+               layer = 'cleaned'
+            )
+
+        if date_limits[0] is not None:
+            cleaned_data_df = cleaned_data_df.filter(
+                pl.col('YearMonth') >= date_limits[0],
+            )
+
+        if date_limits[1] is not None:
+            cleaned_data_df = cleaned_data_df.filter(
+                pl.col('YearMonth') <= date_limits[1],
+            )
+
+        needed_columns: list[str] = ['SKU', "Y", "M"]
+        if not pd.Index(needed_columns).isin(cleaned_data_df.columns).all():
+            missing_columns: list[str] = list(set(needed_columns) - set(cleaned_data_df.columns))
+            raise ColumnNotFoundError(f'Column(s) "{missing_columns}" missing')
+
+        try:
+            featurized_data_df = cleaned_data_df.select([
+                'SKU',
+                'Y',
+                'M',
+                'QT',
+                'ASP',
+            ])
+
+            featurized_data_df: pd.DataFrame = featurized_data_df.to_pandas().reset_index()
+
+            featurized_data_df['ds'] = pd.to_datetime({
+                'year': featurized_data_df['Y'],
+                'month': featurized_data_df['M'],
                 'day': 1
             })
+
         except Exception as e:
-            raise Exception(f'Error while applying transformations in dataframe: {e}')
+            logger.error(f'Error while applying transformations in dataframe: {e}')
+            raise
 
-        final_df: pd.DataFrame = pd.DataFrame()
-        if y == 'ASP':
-            final_df = df
-            final_df = final_df.rename(columns={y: 'y'}).sort_values('ds', ascending=True)
-            final_df = final_df[[x, 'ds', 'y']]
+        if targets is None:
+            logger.error('Failed to specify targets for featurization')
+            raise
 
-        if y == 'QT':
-            final_df: pd.DataFrame = df.rename(columns={y: 'y'}).sort_values('ds', ascending=True)
-            final_df = final_df[[x, 'ds', 'y']]
+        featurized_data_df_list: list[pd.DataFrame] = []
+        for target in targets:
+            try:
+                featurized_target_data_df: pd.DataFrame = featurized_data_df.rename(
+                    columns={target: 'y'}
+                ).sort_values(
+                    'ds',
+                    ascending=True
+                )
 
-        return final_df
+                if len(featurized_target_data_df) == 0:
+                    raise EmptyTableException(f'Featurization step returned empty table')
+
+                featurized_target_data_df = featurized_target_data_df[['SKU', 'ds', 'y']]
+
+                featurized_data_df_list.append(featurized_target_data_df)
+
+                if store:
+                    if output_path is None:
+                        logger.error('Argument output_path must be specified for store=True')
+                        raise
+
+                    featurized_data_path: Path = output_path / 'data' / 'featurized'
+                    Path.mkdir(featurized_data_path, parents=True, exist_ok=True)
+
+                    logger.debug(f'Storing featurized data in data/featurized/{target}.csv')
+
+                    featurized_target_data_df.to_csv(
+                        featurized_data_path / f'{target}.csv',
+                        sep=';',
+                        index=False
+                )
+            except Exception as e:
+                raise Exception(f'Unable to featurize for target: {target}: {e}')
+
+        return featurized_data_df_list
