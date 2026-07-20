@@ -59,6 +59,7 @@ class DatabaseSettings(BaseSettings):
             TrustServerCertificate=yes;
         '''
 
-# Module-level singleton, validated against the environment/".env" file at import time.
-# Set to none for this portfolio project
-database_settings = None
+# Module-level singleton, validated against the environment".env" file at import time. Commented here to bypass
+# validation as this portfolio project doesn't connect to any database
+
+# database_settings = DatabaseSettings()

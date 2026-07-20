@@ -1,4 +1,4 @@
-# Pydantic settings model for the forecast pipeline, populated from "model_settings.yaml" and
+# Pydantic settings model for the forecast pipeline, populated from "pipeline_settings.yaml" and
 # doubling as the "model_settings" object passed into each "ForecastModel" instance.
 
 # The module "PipelineSettings" adds:
@@ -17,7 +17,7 @@
 
 # Note:
 #   "pipeline_settings" below is a module-level singleton constructed at import time by reading
-#   "{general_settings.base_path}/model_settings.yaml". Importing this module therefore immediately
+#   "{general_settings.base_path}/pipeline_settings.yaml". Importing this module therefore immediately
 #   reads and parses that file, raising "FileNotFoundError" if it's missing or a pydantic
 #   "ValidationError" if its contents are invalid.
 
@@ -65,13 +65,14 @@ class PipelineSettings(BaseSettings):
     #     to a "Path" by "treat_output_path" (defaulting to "general_settings.base_path" when None).
 
     model_name: str
+    output_forecast_name: str | None = None
     pipeline_steps: list
     valid_targets: tuple = ('QT', 'ASP')
     targets: list = list(valid_targets)
     skus: list
     raw_table_name: str
-    start_date: str | None = None
-    end_date: str | None = None
+    start_year_month: str | None = None
+    end_year_month: str | None = None
     warmup_days: int = 366
     buffer_months: int = 3
     cutoff_freq: str = "3MS"
@@ -153,8 +154,17 @@ class PipelineSettings(BaseSettings):
             self.output_path = Path(self.output_path)
         return self
 
+    @model_validator(mode='after')
+    def treat_output_forecast_name(self) -> PipelineSettings:
+        # Resolve output_forecast_name, if it is set in pipeline_settings.yaml
 
-with open(general_settings.base_path / 'model_settings.yaml', 'r') as file:
+        if self.output_forecast_name is None:
+            self.output_forecast_name = self.model_name
+
+        return self
+
+
+with open(general_settings.base_path / 'pipeline_settings.yaml', 'r') as file:
     settings_data = yaml.safe_load(file)
 
 # Module-level singleton, see module header Note.

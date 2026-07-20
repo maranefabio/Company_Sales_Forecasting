@@ -90,6 +90,7 @@ class ForecastModel:
 
         model_path: Path = (
             output_path /
+            'data' /
             'output' /
             'models' /
             self.model_settings.model_name /
@@ -132,6 +133,7 @@ class ForecastModel:
             else:
                 parameters_path = (
                     output_path /
+                    'data' /
                     'output' /
                     'parameters' /
                     f'{self.model_settings.model_name}' /
@@ -370,6 +372,7 @@ class ForecastModel:
 
         parameters_path = (
             output_path /
+            'data' /
             'output' /
             'parameters' /
             f'{self.model_settings.model_name}' /
@@ -405,6 +408,7 @@ class ForecastModel:
 
         model_path: Path = (
             output_path /
+            'data' /
             'output' /
             'models' /
             self.model_settings.model_name /

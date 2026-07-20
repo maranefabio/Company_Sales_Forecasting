@@ -1,0 +1,43 @@
+# Configuration for a single forecast pipeline run, loaded by "PipelineSettings"
+# (src/settings/pipeline.py) at import time from "{general_settings.base_path}/pipeline_settings.yaml".
+#
+# Only a subset of "PipelineSettings" fields are set here; any field not present below falls back to
+# its default in the "PipelineSettings" model.
+
+# Name used to namespace persisted parameters, models and forecasts on disk, under this value.
+model_name: 'TEST_MODEL'
+
+# Pipeline steps to run, in this run's case spelled out explicitly rather than via the "ALL"/"ETL"
+# shorthands (see "PipelineSettings.treat_pipeline_steps").
+pipeline_steps:
+#  - EXTRACT
+#  - CLEAN
+#  - FEATURIZE
+  - HYPERPARAMETERIZE
+  - FIT
+  - FORECAST
+
+# Forecast targets to process this run. Must be a subset of "valid_targets" ("QT", "ASP").
+targets:
+  - QT
+#  - ASP
+
+# Lower and upper "YearMonth" bound (inclusive) used to restrict the data used during featurization,
+# hyperparameterization and fitting.
+end_year_month: '2025/05'
+
+# Number of Optuna trials to run per SKU/target during hyperparameter search (overrides the
+# "PipelineSettings" default of 15).
+optimization_n_trials: 30
+
+# Number of future monthly periods to forecast (matches the "PipelineSettings" default of 12; set
+# explicitly here for visibility).
+forecast_horizon_months: 12
+
+# Whether generated forecasts include in-sample (historical) dates (matches the "PipelineSettings"
+# default of True; set explicitly here for visibility).
+include_history: True
+
+# SKUs to process in this run.
+skus:
+  - 'P001'

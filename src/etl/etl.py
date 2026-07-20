@@ -190,7 +190,7 @@ class ETL:
             cleaned_data_df = raw_data_df.with_columns(
                 pl.col('Dt').dt.year().alias('Y'),
                 pl.col('Dt').dt.month().alias('M'),
-                pl.col('Dt').dt.strftime("%Y/m").alias('YearMonth')
+                pl.col('Dt').dt.strftime("%Y/%m").alias('YearMonth')
             ).group_by([
                 'SKU',
                 'YearMonth',

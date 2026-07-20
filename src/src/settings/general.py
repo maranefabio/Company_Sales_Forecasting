@@ -2,7 +2,7 @@
 
 # The module "GeneralSettings" adds:
 # - The project's base working directory ("base_path"), used by other settings modules (e.g.
-#   "PipelineSettings") to locate config files (like "model_settings.yaml") and to resolve a default
+#   "PipelineSettings") to locate config files (like "pipeline_settings.yaml") and to resolve a default
 #   "output_path" when none is explicitly configured.
 
 # The typical workflow is:

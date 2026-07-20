@@ -149,7 +149,7 @@ class Pipeline:
                 self.pipeline_settings.output_path,
                 self.pipeline_settings.targets,
                 True,
-                date_limits=[self.pipeline_settings.start_date, self.pipeline_settings.end_date],
+                date_limits=[self.pipeline_settings.start_year_month, self.pipeline_settings.end_year_month],
             )
 
             logger.info('Featurization complete')
@@ -289,12 +289,15 @@ class Pipeline:
 
             forecasts_path: Path = (
                 self.pipeline_settings.output_path /
+                'data' /
                 'output' /
                 'forecasts' /
-                self.pipeline_settings.model_name
+                self.pipeline_settings.output_forecast_name
             )
 
             Path.mkdir(forecasts_path, parents = True, exist_ok = True)
+
+            logger.debug(f'Saving forecast at {forecasts_path / 'FactForecast.csv'}')
             final_forecast_df.write_csv(forecasts_path / f'FactForecast.csv', separator=';')
 
         logger.info('Forecasting complete')
