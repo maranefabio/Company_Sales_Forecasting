@@ -1,0 +1,31 @@
+# Configuration for a single forecast pipeline run, loaded by "PipelineSettings"
+# (src/settings/pipeline.py) at import time from "{general_settings.base_path}/config/pipeline_settings.yaml".
+
+# Pipeline steps to run. Can be any subset of ["EXTRACT", "CLEAN", "FEATURIZE", "HYPERPARAMETERIZE", "FIT", "FORECAST"],
+# and can contain the combined steps ["ETL", "ALL"], where "ETL" is equivalent to 
+# ["EXTRACT", "CLEAN", "FEATURIZE"] and "ALL" is equivalent to all steps.
+
+pipeline_steps:
+  - EXTRACT
+  - CLEAN
+  - FEATURIZE
+  - HYPERPARAMETERIZE
+  - FIT
+  - FORECAST
+
+# Forecast targets to process this run. Must be a subset of "valid_targets" ("QT", "ASP").
+targets:
+  - QT
+  - ASP
+
+# Lower and upper "YearMonth" bound (inclusive) used to restrict the data used during 
+# featurization, hyperparameterization and fitting.
+start_year_month: NULL
+end_year_month: '2025/04'
+
+# Name of the source table/query used during the EXTRACT step.
+raw_table_name: 'FtoFaturamento'
+
+# SKUs to process in this run. If not specified, all SKUS in the base are
+skus:
+  - 'P001'

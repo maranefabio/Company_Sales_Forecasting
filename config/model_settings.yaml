@@ -1,0 +1,30 @@
+# Configuration for the ForecastModel's objects, loaded by "ModelSettings"
+# (src/settings/model.py) at import time from "{general_settings.base_path}/config/model_settings.yaml".
+
+# Model name.
+# Used for better maintainability and model / parameters persistance
+model_name: "TEST_MODEL"
+
+# Name of the forecast file to be stored in disk. If NULL, it defaults to model_name
+output_forecast_name: NULL
+
+# Wheter to include observed data in the forecast output
+include_history: True
+
+# Warmup days of the cross-validation process
+warmup_days: 366
+
+# Buffer months for the cross-validation process
+buffer_months: 3
+
+# Cutoff frequency, in month-starts, for the cross-validation process
+cutoff_freq: "3MS"
+
+# Horizon of each cross-validation fold.
+cross_validation_horizon_days: 90
+
+# Number of Optuna optimization trials
+optimization_n_trials: 30
+
+# Future horizon, in months, of the forecast output
+forecast_horizon_months: 12

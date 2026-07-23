@@ -1,1 +1,0 @@
--- This would contain a SQL query to the raw data table, inside the database set in .env

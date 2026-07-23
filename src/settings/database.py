@@ -31,7 +31,7 @@ class DatabaseSettings(BaseSettings):
     #     (env var "DB_DRIVER").
 
     model_config = SettingsConfigDict(
-        env_file='.env',
+        env_file='config/.env',
         env_prefix = 'DB_',
         extra='ignore'
     )
@@ -59,7 +59,5 @@ class DatabaseSettings(BaseSettings):
             TrustServerCertificate=yes;
         '''
 
-# Module-level singleton, validated against the environment".env" file at import time. Commented here to bypass
-# validation as this portfolio project doesn't connect to any database
-
-# database_settings = DatabaseSettings()
+# Module-level singleton, validated against the environment/".env" file at import time.
+database_settings = DatabaseSettings()

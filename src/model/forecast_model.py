@@ -1,95 +1,137 @@
-# Time-Series Forecast Model wrapper around Meta's Prophet algorithm, aiming to predict both and QT
-# (Quantity / Sales Volume) and ASP (Average Selling Price) - which can be calculated as NetSales / QT - by SKU.
+"""
+Time-Series Forecast Model wrapper around Meta's Prophet algorithm,
+aiming to predict both and QT (Quantity / Sales Volume) and
+ASP (Average Selling Price) - which can be calculated as NetSales / QT - by SKU.
 
-# The module "Forecast Model" adds:
-#   - Optuna-based hyperparameter optimization with rolling-window cross-validation.
-#   - JSON persistence for both tuned hyperparameters and fitted models.
-#   - Consistent interface for two related but distinct targets, ASP and QT.
+The module "Forecast Model" adds:
+    - Optuna-based hyperparameter optimization with rolling-window cross-validation.
+    - JSON persistence for both tuned hyperparameters and fitted models.
+    - Consistent interface for two related but distinct targets, ASP and QT.
 
-# The typical workflow is:
-#   - With persistance:
-#       >>> model: ForecastModel = ForecastModel(sku="SKU123", target="QT", model_settings=model_settings)
-#       >>> model.hyperparameterize(data_df, store=True, base_path)
-#       >>> model.fit(data-df, parameters_path=parameters_path, store=True)
+The typical workflow is:
+    - With persistance:
+        >>> model: ForecastModel = ForecastModel(
+                sku = 'SKU123',
+                target = 'QT',
+                model_settings=model_settings
+            )
+        >>> model.hyperparameterize(data_df)
+        >>> model.write_parameters(files_path)
 
-# Raw data is required to be a sales time-series containing at least the columns:
-#   - SKU [String]: Stock Keeping Unit / Unique identifier of the product;
-#   - ds [Date / DateTime]: Time dimension;
-#   - QT [Integer]: Quantity sold;
-#   - ASP [Float]: Selling price
+        >>> model.load_parameters(files_path=files_path)
+        >>> model.fit(data_df)
+        >>> model.write_model(files_path)
 
+        >>> model.load_model(files_path=files_path)
+        >>> forecast_df: pd.DataFrame = model.forecast()
+
+    - Without persistance:
+        >>> model: ForecastModel = ForecastModel(
+                sku = 'SKU123',
+                target = 'QT',
+                model_settings=model_settings
+            )
+        >>> model.hyperparameterize(data_df)
+        >>> model.fit(data_df)
+        >>> forecast_df: pd.DataFrame = model.forecast()
+
+Raw data is required to be a sales time-series containing at least the columns:
+    - SKU [String]: Stock Keeping Unit / Unique identifier of the product;
+    - ds [Date / DateTime]: Time dimension;
+    - QT [Integer]: Quantity sold;
+    - ASP [Float]: Selling price
+"""
 
 import json
 import logging
 import pandas as pd
 import polars as pl
 import optuna as ot
+import datetime as dt
 import numpy as np
 from typing import Any
 from pathlib import Path
-from src.settings import PipelineSettings
+from src.settings import ModelSettings
 from pandas import DatetimeIndex
 from prophet import Prophet
 from prophet.diagnostics import cross_validation, performance_metrics
 from prophet.serialize import model_from_json, model_to_json
 
-# Instantiating logger for the file
 logger = logging.getLogger(__name__)
 
-# Accepted dataframe types across the module's public methods (pandas or polars)
 type DataFrameType = pd.DataFrame | pl.DataFrame
 
-
-# Model definition
 class ForecastModel:
-    # Model object is instantiated for each material and target time series, as its optimal parameters vary
-    # between different SKUs
+    """
+    Time-Series Forecast Model wrapper around Meta's Prophet algorithm,
+    aiming to predict both QT (Quantity / Sales Volume) and
+    ASP (Average Selling Price) - which can be calculated as NetSales / QT - by SKU.
+
+    Arguments:
+        - sku (str): Material/SKU identifier
+        - target (str): Forecast target (ASP or QT)
+        - model_settings (ModelSettings): Settings object bundling model
+          configuration (model name, warmup/buffer windows, cross-validation horizon, etc.).
+
+    Atributes:
+        - sku (str): Material/SKU identifier
+        - target (str): Forecast target (ASP or QT)
+        - model_settings (ModelSettings): Settings object bundling model
+          configuration (model name, warmup/buffer windows, cross-validation horizon, etc.).
+        - model (Prophet | None): The fitted Prophet model, or None if not fitted yet.
+        - parameters (dict[str, Any] | None): The best hyperparameters dict, or None if not loaded yet.
+        - best_results_metrics (dict[str, float] | None): The best hyperparameterization metrics, or None if not loaded yet.
+    """
 
     def __init__(
         self,
+        model_settings: ModelSettings,
         sku: str,
         target: str,
-        model_settings: PipelineSettings,
     ) -> None:
-        # Initialize model instance.
-
-        # Args:
-        # - sku: Material/SKU identifier
-        # - target: Forecast target (ASP or QT)
-        # - model_settings: Settings object bundling model configuration (model name, warmup/buffer
-        #   windows, cross-validation horizon, forecast horizon, etc.). Useful for better organization
-        #   and reproducibility of the persistent files.
-
         self.sku: str = sku
+        self.model_settings: ModelSettings = model_settings
         self.target: str = target
-        self.model_settings: PipelineSettings = model_settings
         self.model: Prophet | None = None
         self.parameters: dict[str, Any] | None = None
-        self.best_mape: float | None = None
-        self.best_rmse: float | None = None
+        self.best_results_metrics: dict[str, float] | None = None
 
         logger.debug(f'Model "{self.model_settings.model_name}" instantiated for {self.sku} - {self.target}')
 
     @property
     def is_fitted(self) -> bool:
-        # Allows fitted state to be tracked
+        """Flag if the model has been fitted (or loaded from disk)."""
         return self.model is not None
 
-    def load_model(self, output_path: Path) -> None:
-        # Load a previously serialized model from disk.
+    def get_parameters(self) -> dict[str, Any] | None:
+        """Getter to the hyperparameterization best parameters dict."""
+        return self.parameters
 
-        # Args:
-        #   - output_path: directory where output files are stored. The JSON files containing the serialization
-        #   of the models, produced by "write_model", are at output_path/models
+    def get_best_results(self) -> dict[str, float] | None:
+        """Getter to the hyperparameterization best results metrics."""
+        return self.best_results_metrics
 
-        # Raises:
-        #   - Exception: re-raises any error encountered while reading or deserializing.
+    def get_model(self) -> Prophet | None:
+        """Getter to the fitted model."""
+        return self.model
+
+    def load_model(self, files_path: Path) -> None:
+        """
+        Load a previously serialized model from disk.
+
+        Arguments:
+            - files_path (Path): Root directory where the model is stored. The JSON file containing the serialization
+              of the model is expected at "files_path/data/output/models/{model_name}/{target}/{sku}_model.json".
+
+        Raises:
+            - Exception: Re-raises any error encountered while reading the model file or deserializing it.
+        """
 
         if self.model is not None:
             logger.warning(f'Model already loaded for {self.sku} - {self.target}. Overriding')
 
         model_path: Path = (
-            output_path /
+                files_path /
             'data' /
             'output' /
             'models' /
@@ -109,22 +151,24 @@ class ForecastModel:
     def load_parameters(
         self,
         parameters: dict[str, Any] | None = None,
-        output_path: Path | None = None
+        files_path: Path | None = None
     ) -> None:
-        # Loads parameters from disk or from dictionary passed as argument.
+        """
+        Load hyperparameters from disk or from a dictionary.
 
-        # Args:
-        #   - parameters: dictionary containing the parameters.
-        #   - output_path: directory where output files are stored.
+        Arguments:
+            - parameters (dict[str, Any] | None): Dictionary containing the parameters.
+            - files_path (Path | None): Directory where output files are stored.
 
-        # Raises:
-        #   - ArgumentError: If both parameters and base_path are None.
-        #   - Exception: Re-raises any error encountered while writing the file.
+        Raises:
+            - ValueError: If both parameters and files_path are None.
+            - Exception: Re-raises any error encountered while reading the parameters file.
+        """
 
-        if [parameters, output_path] == [None, None]:
+        if [parameters, files_path] == [None, None]:
             raise ValueError(f'Argument base_path cannot be None for parameters=None')
 
-        if output_path is not None:
+        if files_path is not None:
             if parameters is not None:
                 logger.warning(f'Overriding parameters at runtime for {self.sku} - {self.target}')
 
@@ -132,7 +176,7 @@ class ForecastModel:
 
             else:
                 parameters_path = (
-                    output_path /
+                    files_path /
                     'data' /
                     'output' /
                     'parameters' /
@@ -154,41 +198,24 @@ class ForecastModel:
         self,
         df: DataFrameType
     ) -> dict[str, Any]:
-        # Run an Optuna hyperparameter search using rolling-origin cross-validation.
+        """
+        Perform hyperparameter optimization for the Prophet model.
 
-        # Cutoffs are generated starting one warm-up period ("model_settings.warmup_days")
-        # after the first observation and ending "model_settings.buffer_months" before the last observation,
-        # spaced every "model_settings.cutoff_freq". Each trial fits a Prophet model
-        # with sampled hyperparameters and scores it (RMSE, the optimization
-        # objective; MAPE, tracked alongside for reporting) across all cutoffs
-        # at a "model_settings.cross_validation_horizon_days"-length forecast.
+        Arguments:
+            - df: Date ordered training data with "ds" (datetime) and "y" (numeric target) columns.
 
-        # Note:
-        #   This method searches for the best hyperparameters and stores
-        #   them, but does not leave self.model fit on those best
-        #   parameters — the last trial's model is what remains in memory.
+        Returns:
+            A dict with keys:
+                - parameters: the best hyperparameter dict found;
 
-        #   Call "fit" with the resulting parameters file afterward to
-        #   obtain a model trained on the best configuration.
+                - rmse: the corresponding mean RMSE, used as the optimization objective;
+                
+                - mape: the corresponding mean MAPE, tracked for reporting purposes.
 
-        #   The Number of Optuna trials,the warmup period, cross-validation horizon and
-        #   cutoff frequency are all taken from "self.model_settings" rather than passed explicitly.
-
-        # Args:
-        #   - df: Date ordered training data with "ds" (datetime) and "y" (numeric target) columns,
-        #     as Prophet's convention. Accepts either a pandas or polars DataFrame; polars inputs are
-        #     converted to pandas internally.
-
-
-
-        # Returns:
-        #   A dict with keys "parameters" (the best hyperparameter dict found), "rmse" (the corresponding
-        #   mean RMSE, used as the optimization objective) and "mape" (the corresponding mean MAPE, tracked
-        #   for reporting purposes).
-
-        # Raises:
-        #   - Exception: Re-raises any error encountered during cross-validation or
-        #   the Optuna study.
+        Raises:
+            - Exception: Re-raises any error encountered during cross-validation or
+            the Optuna study.
+        """
 
         if isinstance(df, pl.DataFrame):
             try:
@@ -200,16 +227,16 @@ class ForecastModel:
         warmup_days: int = self.model_settings.warmup_days
         buffer_months: int = self.model_settings.buffer_months
 
-        start_date: np.datetime64 = (
+        series_start_date: np.datetime64 = (
                 df['ds'].head(1).values[0].astype('datetime64[M]') + np.timedelta64(warmup_days, 'D')
         )
-        end_date: np.datetime64 = (
+        series_end_date: np.datetime64 = (
                 df['ds'].tail(1).values[0].astype('datetime64[M]') - np.timedelta64(buffer_months, 'M')
         )
 
         cutoffs: DatetimeIndex = pd.date_range(
-            start=start_date,
-            end=end_date,
+            start=series_start_date,
+            end=series_end_date,
             freq=self.model_settings.cutoff_freq,
         )
 
@@ -282,9 +309,11 @@ class ForecastModel:
         }
 
         self.parameters = result.get('parameters')
-        self.best_rmse = result.get('rmse')
-        self.best_mape = result.get('mape')
 
+        self.best_results_metrics =  {
+            'rmse': result.get('rmse'),
+            'mape': result.get('mape')
+        }
         self.model = None
 
         return result
@@ -294,16 +323,19 @@ class ForecastModel:
         self,
         df: DataFrameType
     ) -> None:
-        # Fit a Prophet model on "df" using parameters loaded in the object.
+        """
+        Fit a Prophet model on "df" using parameters loaded in the object.
 
-        # Args:
-        #   - df: Sorted training data with "ds" (datetime) and "y" (numeric target)
-        #     columns, as Prophet's convention. Accepts either a pandas or polars DataFrame; non-pandas
-        #     inputs are converted to pandas internally.
+        Arguments:
+            - df (DataFrameType): Sorted training data with "ds" (datetime) and "y" (numeric target)
+              columns, as Prophet's convention. Accepts either a pandas or polars DataFrame. 
+              Prophet dfs are converted to pandas internally.
 
-        # Raises:
-        #   - Exception: Re-raises any error encountered while reading the
-        #     parameters file or fitting the model.
+        Raises:
+            - Exception: Re-raises any error encountered while reading the
+              parameters file or fitting the model.
+        """
+
 
         if not isinstance(df, pd.DataFrame):
             try:
@@ -323,20 +355,23 @@ class ForecastModel:
             raise
 
     def forecast(self) -> pd.DataFrame:
-        # Generate a forecast beyond the training history.
-        # The number of future monthly periods is taken from "self.model_settings.forecast_horizon_months",
-        # and whether historical (in-sample) dates are included in the returned dataframe is controlled
-        # by "self.model_settings.include_history". The future dataframe is built on a monthly start ("MS") frequency.
-        #
-        # Returns:
-        #   The Prophet prediction DataFrame (includes historical fitted
-        #   values - if required - plus future predictions, plus upper and lower boundaries)
-        #
-        # Raises:
-        #   - Exception: If no model has been fit or loaded yet ("Model not loaded"), or re-raised
-        #     from any error encountered while building the future dataframe or predicting.
-        #     Note: unlike "write_model", this does not raise "ModelNotLoadedException" specifically —
-        #     both the not-loaded case and any downstream errors surface as a plain "Exception".
+        """
+        Generate a forecast beyond the training history, covering the specified horizon.
+        The number of future monthly periods is taken from "self.model_settings.forecast_horizon_months",
+        and whether historical (in-sample) dates are included in the returned dataframe is controlled
+        by "self.model_settings.include_history". The future dataframe is built on a monthly start ("MS") frequency.
+        
+        Returns:
+            The Prophet prediction DataFrame (includes historical fitted
+            values - if required - plus future predictions, plus upper and lower boundaries)
+        
+        Raises:
+            - ModelNotLoadedException: If no model has been fit or loaded yet ("Model not loaded").
+            - Exception: Re-raises any error encountered while building the future dataframe or predicting.
+              Note: unlike "write_model", this does not raise "ModelNotLoadedException" specifically —
+              both the not-loaded case and any downstream errors surface as a plain "Exception".
+        """
+
 
         if self.model is None:
             raise ModelNotLoadedException(f'Model not loaded for {self.sku} - {self.target}')
@@ -350,28 +385,32 @@ class ForecastModel:
                 include_history=self.model_settings.include_history
             )
 
-            return self.model.predict(future)
+            forecast: pd.DataFrame = self.model.predict(future)
+
+            return forecast
 
         except Exception as e:
             logger.error(f'Error during model forecast for {self.sku} - {self.target}: {e}')
             raise
 
 
-    def write_parameters(self, output_path: Path) -> None:
-        # Store the current loaded parameters to disk. Allowed only if self.parameters is not None.
+    def write_parameters(self, files_path: Path) -> None:
+        """
+        Stores the current loaded parameters to disk. Allowed only if self.parameters is not None.
 
-        # Args:
-        #   - output_path: directory where output files are stored.
+        Arguments:
+          - files_path (Path): directory where output files are stored.
 
-        # Raises:
-        #   - ParametersNotLoadedException: If no parameters has been loaded yet.
-        #   - Exception: Re-raises any error encountered while writing the file.
+        Raises:
+          - ParametersNotLoadedException: If no parameters has been loaded yet.
+          - Exception: Re-raises any error encountered while writing the file.
+        """
 
         if self.parameters is None:
             raise ParametersNotLoadedException(f'Parameters for {self.sku} - {self.target} not loaded')
 
         parameters_path = (
-            output_path /
+                files_path /
             'data' /
             'output' /
             'parameters' /
@@ -393,21 +432,23 @@ class ForecastModel:
             logger.error(f'Error while saving parameters for {self.sku} - {self.target}: {e}')
             raise
 
-    def write_model(self, output_path: Path) -> None:
-        # Serialize and store the current loaded model to disk. Allowed only if model.is_fitted = True.
+    def write_model(self, files_path: Path) -> None:
+        """
+        Serialize and store the current loaded model to disk. Allowed only if model.is_fitted = True.
 
-        # Args:
-        #   - output_path: directory where output files are stored.
+        Arguments:
+          - files_path (Path): directory where output files are stored.
 
-        # Raises:
-        #   - ModelNotLoadedException: If no model has been fit or loaded yet.
-        #   - Exception: Re-raises any error encountered while writing the file.
+        Raises:
+          - ModelNotLoadedException: If no model has been fit or loaded yet.
+          - Exception: Re-raises any error encountered while writing the file.
+        """
 
         if not self.is_fitted:
             raise ModelNotLoadedException(f'Model for {self.sku} - {self.target} not fitted')
 
         model_path: Path = (
-            output_path /
+            files_path /
             'data' /
             'output' /
             'models' /
@@ -430,9 +471,9 @@ class ForecastModel:
 
 
 class ModelNotLoadedException(RuntimeError):
-    # Raised when an operation needs an unloaded model
+    """Raised when an operation needs an unloaded model"""
     pass
 
 class ParametersNotLoadedException(RuntimeError):
-    # Raised when an operaton need an unloaded set of parameters
+    """Raised when an operation needs an unloaded set of parameters"""
     pass
